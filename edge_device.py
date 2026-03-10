@@ -30,6 +30,8 @@ import sys
 import time
 import argparse
 import threading
+import tty
+import termios
 import numpy as np
 import sounddevice as sd
 from scipy.io.wavfile import write as write_wav
@@ -58,6 +60,9 @@ from translate import (
 WHISPER_RATE = 16000     # Whisper expects 16kHz — we resample to this
 CHANNELS = 1             # Mono audio
 MAX_RECORD_SECONDS = 30  # Safety limit
+
+# Directory to save recorded & generated audio for review
+RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
 # GPIO pins (BCM numbering) — only used with --gpio
 BUTTON_PIN = 17
@@ -324,8 +329,8 @@ class TranslatorDevice:
 
         We just copy it into our buffer list. That's it.
         """
-        if status:
-            print(f"⚠️  Audio status: {status}")
+        # Silently ignore overflow — it just means we lost a chunk while idle
+        # (this is expected since the stream stays open between recordings)
 
         if self.is_recording:
             self.audio_buffer.append(indata.copy())
@@ -351,7 +356,7 @@ class TranslatorDevice:
         if self.use_gpio:
             print("🎤 Recording... (release button to stop)")
         else:
-            print("🎤 Recording... (press ENTER to stop)")
+            print("🎤 Recording... (press [r] to stop)")
 
     def stop_recording(self):
         """Called when button is RELEASED (or Enter again in keyboard mode)."""
@@ -424,7 +429,7 @@ class TranslatorDevice:
             if self.use_gpio:
                 print("🟢 Ready! Hold button to speak.\n")
             else:
-                print("🟢 Ready! Press ENTER to speak.\n")
+                print("🟢 Ready! Press [r] to speak.\n")
 
     # ─────────────────────────────────────
     # PROCESSING PIPELINE
@@ -437,12 +442,21 @@ class TranslatorDevice:
         1. Whisper:   audio_data (numpy array) → text + detected language
         2. MarianMT:  text → translated text
         3. MiniLM:    verify translation quality
-        4. Edge-TTS:  translated text → audio file → play through USB speaker
+        4. Piper TTS: translated text → audio file → play through USB speaker
+
+        Audio files are saved to recordings/ for review.
         """
         t_pipeline = time.time()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        # ── Save input audio for review ──
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
+        input_wav = os.path.join(RECORDINGS_DIR, f"{timestamp}_input.wav")
+        write_wav(input_wav, WHISPER_RATE, (audio_data * 32767).astype(np.int16))
+        print(f"\n💾 Input saved: {input_wav}")
 
         # ── Step 1: Transcribe with Whisper ──
-        print("\n🔄 Transcribing speech...")
+        print("🔄 Transcribing speech...")
         t_step = time.time()
         text, detected_lang = transcribe_audio(
             self.whisper_model, audio_data=audio_data
@@ -480,10 +494,21 @@ class TranslatorDevice:
         t_verify = result['time_seconds']
         print_verification(result, time.time() - t_pipeline)
 
-        # ── Step 5: Speak the translation through USB speaker ──
+        # ── Step 5: Speak the translation & save output audio ──
+        output_wav = os.path.join(RECORDINGS_DIR, f"{timestamp}_output_{target_lang}.wav")
         print(f"🔊 Speaking in {tgt_name}...")
         t_step = time.time()
-        speak(translated, lang=target_lang)
+
+        # Generate TTS to the saved file, then play it
+        from translate import text_to_speech, play_audio
+        tts_result = text_to_speech(translated, lang=target_lang, output_file=output_wav)
+        if tts_result:
+            play_audio(output_wav)
+            print(f"💾 Output saved: {output_wav}")
+        else:
+            # Fallback: use speak() which uses a temp file
+            speak(translated, lang=target_lang)
+
         t_tts = time.time() - t_step
 
         # ── Summary ──
@@ -495,6 +520,7 @@ class TranslatorDevice:
         print(f"     TTS + playback:   {t_tts:.2f}s")
         print(f"     ─────────────────────────")
         print(f"     Total:            {t_total:.2f}s")
+        print(f"     📁 Files: {RECORDINGS_DIR}/")
 
     # ─────────────────────────────────────
     # MAIN LOOPS
@@ -520,9 +546,31 @@ class TranslatorDevice:
             except KeyboardInterrupt:
                 pass
 
+    @staticmethod
+    def _get_key():
+        """
+        Read a single keypress without waiting for Enter.
+        Uses raw terminal mode so we can detect 'r' instantly.
+        Returns the character pressed (lowercase).
+        """
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch.lower()
+
     def run_keyboard_mode(self):
-        """Keyboard mode — press Enter to start/stop recording."""
-        print("🟢 Ready! Press ENTER to start recording, ENTER again to stop.\n")
+        """
+        Keyboard mode — press 'r' to start recording, 'r' again to stop.
+        Single keypress, no need to hold or press Enter.
+        Press 'q' or Ctrl+C to quit.
+        """
+        print("🟢 Ready!")
+        print("   Press [r] to start/stop recording")
+        print("   Press [q] to quit\n")
 
         # Open audio stream from USB mic at its native rate
         with sd.InputStream(samplerate=self.mic_rate,
@@ -533,19 +581,27 @@ class TranslatorDevice:
                             callback=self.audio_callback):
             try:
                 while True:
-                    input("  [Press ENTER to record] ")
+                    key = self._get_key()
 
-                    if self.is_processing:
-                        print("  ⏳ Still processing... wait.\n")
-                        continue
+                    # Ctrl+C sends '\x03'
+                    if key in ('q', '\x03'):
+                        break
 
-                    self.start_recording()
-                    input("  [Press ENTER to stop]   ")
-                    self.stop_recording()
+                    if key == 'r':
+                        if self.is_processing:
+                            print("  ⏳ Still processing... wait.\n")
+                            continue
 
-                    # Wait for processing to finish
-                    while self.is_processing:
-                        time.sleep(0.1)
+                        if not self.is_recording:
+                            # Start recording
+                            self.start_recording()
+                        else:
+                            # Stop recording → triggers processing
+                            self.stop_recording()
+
+                            # Wait for processing to finish before accepting input
+                            while self.is_processing:
+                                time.sleep(0.1)
 
             except (KeyboardInterrupt, EOFError):
                 pass
@@ -576,7 +632,7 @@ class TranslatorDevice:
 
         # Show device summary
         print("─" * 50)
-        mode = "GPIO push-to-talk" if self.use_gpio else "Keyboard (ENTER)"
+        mode = "GPIO push-to-talk" if self.use_gpio else "Keyboard [r] to toggle"
         print(f"  Mode:       {mode}")
         print(f"  Audio in:   USB mic [{mic_idx}] @ {self.mic_rate} Hz")
         print(f"  Audio out:  Speaker [{spk_idx}]")

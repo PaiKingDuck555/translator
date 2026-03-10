@@ -18,6 +18,9 @@ piper-voices/
 *.mp3
 *.wav
 
+# Saved recordings (audio review files)
+recordings/
+
 # OS files
 .DS_Store
 
