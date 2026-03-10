@@ -6,11 +6,32 @@ import subprocess
 from pathlib import Path
 
 from transformers import MarianMTModel, MarianTokenizer
-import whisper
-import edge_tts
-import sounddevice as sd
 import numpy as np
-from scipy.io.wavfile import write as write_wav
+
+# ── Optional audio imports (graceful if missing) ──
+AUDIO_AVAILABLE = False
+TTS_AVAILABLE = False
+
+try:
+    import sounddevice as sd
+    from scipy.io.wavfile import write as write_wav
+    AUDIO_AVAILABLE = True
+except (OSError, ImportError):
+    print("⚠️  Audio recording unavailable (PortAudio/sounddevice not found).")
+    print("   Text-only mode will still work.\n")
+
+try:
+    import edge_tts
+    TTS_AVAILABLE = True
+except ImportError:
+    print("⚠️  Text-to-speech unavailable (edge-tts not found).\n")
+
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    print("⚠️  Whisper unavailable (openai-whisper not found).\n")
 
 
 # ──────────────────────────────────────────────
@@ -36,12 +57,20 @@ LANGUAGE_NAMES = {
 # ──────────────────────────────────────────────
 def load_whisper_model(size="base"):
     """Load Whisper model. Sizes: tiny, base, small, medium, large"""
+    if not WHISPER_AVAILABLE:
+        print("⚠️  Whisper not installed — skipping.")
+        return None
     print(f"Loading Whisper ({size}) model...")
     return whisper.load_model(size)
 
 
 def record_audio(duration=RECORD_SECONDS, sample_rate=SAMPLE_RATE):
     """Record audio from microphone."""
+    if not AUDIO_AVAILABLE:
+        print("❌ Cannot record: PortAudio/sounddevice not available.")
+        print("   Install with: sudo apt install libportaudio2")
+        return None
+
     print(f"🎤 Recording for {duration} seconds... (speak now!)")
     audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate,
                    channels=1, dtype="float32")
@@ -52,6 +81,10 @@ def record_audio(duration=RECORD_SECONDS, sample_rate=SAMPLE_RATE):
 
 def transcribe_audio(whisper_model, audio_data=None, audio_file=None):
     """Transcribe audio to text using Whisper."""
+    if whisper_model is None:
+        print("❌ Whisper model not loaded.")
+        return "", "en"
+
     if audio_file:
         result = whisper_model.transcribe(audio_file)
     elif audio_data is not None:
@@ -109,6 +142,9 @@ def translate_text(text, models, source_lang, target_lang):
 # ──────────────────────────────────────────────
 async def text_to_speech(text, lang="es", output_file="output.mp3"):
     """Convert text to speech using edge-tts."""
+    if not TTS_AVAILABLE:
+        print("❌ edge-tts not available.")
+        return None
     voice = VOICES.get(lang, VOICES["en"])
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_file)
@@ -117,6 +153,10 @@ async def text_to_speech(text, lang="es", output_file="output.mp3"):
 
 def speak(text, lang="es"):
     """Synchronous wrapper to generate and play TTS audio."""
+    if not TTS_AVAILABLE:
+        print("❌ Text-to-speech not available.")
+        return
+
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         output_file = f.name
 
@@ -156,12 +196,24 @@ def play_audio(filepath):
 # ──────────────────────────────────────────────
 def voice_translate(whisper_model, translation_models, source_lang, target_lang):
     """Full pipeline: Voice → Text → Translate → Voice"""
+    if not AUDIO_AVAILABLE:
+        print("\n❌ Voice mode requires a microphone + PortAudio.")
+        print("   Install: sudo apt install libportaudio2")
+        print("   Then connect a USB microphone.\n")
+        return
+
+    if whisper_model is None:
+        print("\n❌ Whisper model not loaded. Cannot do voice mode.\n")
+        return
+
     src_name = LANGUAGE_NAMES.get(source_lang, source_lang)
     tgt_name = LANGUAGE_NAMES.get(target_lang, target_lang)
 
     # Step 1: Record & transcribe
     print(f"\n🎤 Speak in {src_name}...")
     audio = record_audio()
+    if audio is None:
+        return
     text, detected_lang = transcribe_audio(whisper_model, audio_data=audio)
     print(f"📝 You said: \"{text}\"")
 
@@ -213,15 +265,27 @@ def main():
     print("  English ↔ Spanish")
     print("=" * 50)
 
-    # Load all models
+    # Load models
     whisper_model = load_whisper_model("base")
     translation_models = load_translation_models()
-    print("\n✅ All models loaded!\n")
+    print("\n✅ Models loaded!\n")
+
+    # Show capability summary
+    print("Capabilities:")
+    print(f"  Translation (text): ✅ Ready")
+    print(f"  Speech-to-text:     {'✅ Ready' if whisper_model else '❌ Unavailable'}")
+    print(f"  Microphone input:   {'✅ Ready' if AUDIO_AVAILABLE else '❌ No PortAudio/mic'}")
+    print(f"  Text-to-speech:     {'✅ Ready' if TTS_AVAILABLE else '❌ No edge-tts'}")
+    print()
 
     while True:
         print("Choose a mode:")
-        print("  [1] 🎤 Voice: English → Spanish")
-        print("  [2] 🎤 Voice: Spanish → English")
+        if AUDIO_AVAILABLE and whisper_model:
+            print("  [1] 🎤 Voice: English → Spanish")
+            print("  [2] 🎤 Voice: Spanish → English")
+        else:
+            print("  [1] 🎤 Voice: English → Spanish  (unavailable)")
+            print("  [2] 🎤 Voice: Spanish → English  (unavailable)")
         print("  [3] ⌨️  Text-only translation")
         print("  [4] 🚪 Quit")
 
