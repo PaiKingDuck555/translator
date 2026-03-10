@@ -492,7 +492,7 @@ class TranslatorDevice:
             detected_lang, target_lang, self.embedding_model
         )
         t_verify = result['time_seconds']
-        print_verification(result, time.time() - t_pipeline)
+        print_verification(result, t_pipeline)  # pass start timestamp, not duration
 
         # ── Step 5: Speak the translation & save output audio ──
         output_wav = os.path.join(RECORDINGS_DIR, f"{timestamp}_output_{target_lang}.wav")
@@ -567,44 +567,62 @@ class TranslatorDevice:
         Keyboard mode — press 'r' to start recording, 'r' again to stop.
         Single keypress, no need to hold or press Enter.
         Press 'q' or Ctrl+C to quit.
+
+        The audio stream is ONLY open while recording.
+        This prevents input overflow during processing (Whisper can
+        take 10-50s on Pi CPU — no point streaming audio we'd discard).
         """
         print("🟢 Ready!")
         print("   Press [r] to start/stop recording")
         print("   Press [q] to quit\n")
 
-        # Open audio stream from USB mic at its native rate
-        with sd.InputStream(samplerate=self.mic_rate,
+        self._audio_stream = None
+
+        try:
+            while True:
+                key = self._get_key()
+
+                # Ctrl+C sends '\x03'
+                if key in ('q', '\x03'):
+                    break
+
+                if key == 'r':
+                    if self.is_processing:
+                        print("  ⏳ Still processing... wait.\n")
+                        continue
+
+                    if not self.is_recording:
+                        # Open stream and start recording
+                        self._audio_stream = sd.InputStream(
+                            samplerate=self.mic_rate,
                             channels=CHANNELS,
                             blocksize=self.block_size,
                             device=self.mic_index,
                             dtype="float32",
-                            callback=self.audio_callback):
-            try:
-                while True:
-                    key = self._get_key()
+                            callback=self.audio_callback,
+                        )
+                        self._audio_stream.start()
+                        self.start_recording()
+                    else:
+                        # Stop recording
+                        self.stop_recording()
 
-                    # Ctrl+C sends '\x03'
-                    if key in ('q', '\x03'):
-                        break
+                        # Close stream immediately — no audio needed during processing
+                        if self._audio_stream:
+                            self._audio_stream.stop()
+                            self._audio_stream.close()
+                            self._audio_stream = None
 
-                    if key == 'r':
-                        if self.is_processing:
-                            print("  ⏳ Still processing... wait.\n")
-                            continue
+                        # Wait for processing to finish before accepting input
+                        while self.is_processing:
+                            time.sleep(0.1)
 
-                        if not self.is_recording:
-                            # Start recording
-                            self.start_recording()
-                        else:
-                            # Stop recording → triggers processing
-                            self.stop_recording()
-
-                            # Wait for processing to finish before accepting input
-                            while self.is_processing:
-                                time.sleep(0.1)
-
-            except (KeyboardInterrupt, EOFError):
-                pass
+        except (KeyboardInterrupt, EOFError):
+            pass
+        finally:
+            if self._audio_stream:
+                self._audio_stream.stop()
+                self._audio_stream.close()
 
     def run(self):
         """Start the device."""

@@ -206,18 +206,27 @@ def record_audio(duration=RECORD_SECONDS, sample_rate=SAMPLE_RATE):
 
 
 def transcribe_audio(whisper_model, audio_data=None, audio_file=None):
-    """Transcribe audio to text using Whisper. Returns (text, language_code)."""
+    """Transcribe audio to text using Whisper. Returns (text, language_code).
+
+    Forces FP32 since the Raspberry Pi CPU does not support FP16.
+    Whisper would print a warning and fall back anyway, but explicitly
+    setting fp16=False avoids the warning and prevents any issues.
+    """
     if whisper_model is None:
         print("❌ Whisper model not loaded.")
         return "", "en"
 
+    # Pi CPU doesn't support FP16 — force FP32 to avoid the warning
+    # and ensure correct computation on ARM64
+    transcribe_opts = {"fp16": False}
+
     if audio_file:
-        result = whisper_model.transcribe(audio_file)
+        result = whisper_model.transcribe(audio_file, **transcribe_opts)
     elif audio_data is not None:
         # Save to temp wav file for Whisper
         temp_path = tempfile.mktemp(suffix=".wav")
         write_wav(temp_path, SAMPLE_RATE, (audio_data * 32767).astype(np.int16))
-        result = whisper_model.transcribe(temp_path)
+        result = whisper_model.transcribe(temp_path, **transcribe_opts)
         os.unlink(temp_path)
     else:
         raise ValueError("Provide either audio_data or audio_file")
