@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""
+Edge Translator Device — Raspberry Pi 5
+========================================
+
+Standalone voice-to-voice translation device.
+Press Enter (or push-to-talk button) → speak → press Enter (or release) → hear translation.
+
+Hardware Setup:
+  ┌─────────────────────────────────────────────────────┐
+  │  USB MICROPHONE  → any USB port                     │
+  │  USB SPEAKER     → any USB port (or 3.5mm jack)     │
+  │                                                     │
+  │  Optional GPIO (use --gpio flag):                   │
+  │    BUTTON: GPIO 17 (pin 11) → GND (pin 9)          │
+  │    GREEN LED: GPIO 27 (pin 13) → 330Ω → GND        │
+  │    RED LED: GPIO 22 (pin 15) → 330Ω → GND          │
+  └─────────────────────────────────────────────────────┘
+
+Usage:
+    python edge_device.py              # Keyboard mode (default)
+    python edge_device.py --gpio       # GPIO push-to-talk mode
+    python edge_device.py --list-audio # List available USB audio devices
+    python edge_device.py --mic 1      # Use specific mic (device index)
+    python edge_device.py --speaker 3  # Use specific speaker (device index)
+"""
+
+import os
+import sys
+import time
+import argparse
+import threading
+import numpy as np
+import sounddevice as sd
+from scipy.io.wavfile import write as write_wav
+import tempfile
+
+# Import translation functions from our main module
+from translate import (
+    load_whisper_model,
+    load_translation_models,
+    load_embedding_model,
+    transcribe_audio,
+    translate_text,
+    verify_translation,
+    print_verification,
+    speak,
+    AUTO_TRANSLATE_MAP,
+    LANGUAGE_NAMES,
+)
+
+# ──────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────
+SAMPLE_RATE = 16000      # Whisper expects 16kHz
+CHANNELS = 1             # Mono audio
+BLOCK_SIZE = 1600        # 100ms chunks (16000 × 0.1)
+MAX_RECORD_SECONDS = 30  # Safety limit
+
+# GPIO pins (BCM numbering) — only used with --gpio
+BUTTON_PIN = 17
+LED_GREEN = 27
+LED_RED = 22
+
+
+# ──────────────────────────────────────────────
+# USB AUDIO HELPERS
+# ──────────────────────────────────────────────
+def list_audio_devices():
+    """List all available audio devices with their index, name, and type."""
+    devices = sd.query_devices()
+    default_in, default_out = sd.default.device
+
+    print("\n🎤 Available Audio Devices:")
+    print("─" * 60)
+
+    inputs = []
+    outputs = []
+
+    for i, d in enumerate(devices):
+        is_input = d['max_input_channels'] > 0
+        is_output = d['max_output_channels'] > 0
+        tags = []
+        if i == default_in:
+            tags.append("DEFAULT INPUT")
+        if i == default_out:
+            tags.append("DEFAULT OUTPUT")
+        tag_str = f"  ← {', '.join(tags)}" if tags else ""
+
+        if is_input:
+            inputs.append((i, d['name'], d['max_input_channels'], tag_str))
+        if is_output:
+            outputs.append((i, d['name'], d['max_output_channels'], tag_str))
+
+    print("\n  📥 INPUT devices (microphones):")
+    if inputs:
+        for idx, name, ch, tag in inputs:
+            print(f"     [{idx}] {name} ({ch}ch){tag}")
+    else:
+        print("     ⚠️  No input devices found! Plug in a USB mic.")
+
+    print("\n  📤 OUTPUT devices (speakers):")
+    if outputs:
+        for idx, name, ch, tag in outputs:
+            print(f"     [{idx}] {name} ({ch}ch){tag}")
+    else:
+        print("     ⚠️  No output devices found! Plug in a USB speaker.")
+
+    print("─" * 60)
+    return inputs, outputs
+
+
+def configure_audio_devices(mic_index=None, speaker_index=None):
+    """
+    Set the default sounddevice input/output devices.
+    If indices are provided, use those; otherwise use system defaults.
+    Returns (input_device_index, output_device_index).
+    """
+    default_in, default_out = sd.default.device
+
+    # Configure microphone (input)
+    if mic_index is not None:
+        try:
+            info = sd.query_devices(mic_index)
+            if info['max_input_channels'] == 0:
+                print(f"⚠️  Device [{mic_index}] '{info['name']}' has no input channels.")
+                print(f"   Falling back to default input [{default_in}].")
+                mic_index = default_in
+            else:
+                print(f"🎤 Mic: [{mic_index}] {info['name']}")
+        except Exception as e:
+            print(f"⚠️  Invalid mic device index {mic_index}: {e}")
+            print(f"   Falling back to default input [{default_in}].")
+            mic_index = default_in
+    else:
+        mic_index = default_in
+        if mic_index is not None:
+            info = sd.query_devices(mic_index)
+            print(f"🎤 Mic: [{mic_index}] {info['name']} (default)")
+        else:
+            print("⚠️  No default input device found! Plug in a USB mic.")
+
+    # Configure speaker (output)
+    if speaker_index is not None:
+        try:
+            info = sd.query_devices(speaker_index)
+            if info['max_output_channels'] == 0:
+                print(f"⚠️  Device [{speaker_index}] '{info['name']}' has no output channels.")
+                print(f"   Falling back to default output [{default_out}].")
+                speaker_index = default_out
+            else:
+                print(f"🔊 Speaker: [{speaker_index}] {info['name']}")
+        except Exception as e:
+            print(f"⚠️  Invalid speaker device index {speaker_index}: {e}")
+            print(f"   Falling back to default output [{default_out}].")
+            speaker_index = default_out
+    else:
+        speaker_index = default_out
+        if speaker_index is not None:
+            info = sd.query_devices(speaker_index)
+            print(f"🔊 Speaker: [{speaker_index}] {info['name']} (default)")
+        else:
+            print("⚠️  No default output device found! Plug in a USB speaker.")
+
+    # Apply to sounddevice defaults
+    sd.default.device = (mic_index, speaker_index)
+
+    return mic_index, speaker_index
+
+
+class TranslatorDevice:
+    """Standalone translation device with USB audio and optional GPIO."""
+
+    def __init__(self, use_gpio=False, mic_index=None, speaker_index=None):
+        self.use_gpio = use_gpio
+
+        # Audio state
+        self.audio_buffer = []
+        self.is_recording = False
+        self.is_processing = False
+        self.mic_index = mic_index
+        self.speaker_index = speaker_index
+
+        # Models (loaded at boot)
+        self.whisper_model = None
+        self.translation_models = None
+        self.embedding_model = None
+
+        # GPIO hardware (optional)
+        self.button = None
+        self.led_ready = None
+        self.led_busy = None
+
+        if self.use_gpio:
+            self._init_gpio()
+
+    # ─────────────────────────────────────
+    # GPIO SETUP (optional, --gpio flag)
+    # ─────────────────────────────────────
+    def _init_gpio(self):
+        """Initialize GPIO pins for button and LEDs."""
+        try:
+            from gpiozero import Button, LED
+            self.button = Button(BUTTON_PIN, pull_up=True, bounce_time=0.05)
+            self.led_ready = LED(LED_GREEN)
+            self.led_busy = LED(LED_RED)
+            print(f"✅ GPIO initialized:")
+            print(f"   Button:    GPIO {BUTTON_PIN} (pin 11)")
+            print(f"   Green LED: GPIO {LED_GREEN} (pin 13)")
+            print(f"   Red LED:   GPIO {LED_RED} (pin 15)")
+        except Exception as e:
+            print(f"⚠️  GPIO init failed: {e}")
+            print("   Falling back to keyboard mode.\n")
+            self.use_gpio = False
+
+    def set_state_ready(self):
+        """Visual indicator: ready for input."""
+        if self.led_ready:
+            self.led_ready.on()
+        if self.led_busy:
+            self.led_busy.off()
+
+    def set_state_recording(self):
+        """Visual indicator: recording audio."""
+        if self.led_ready:
+            self.led_ready.off()
+        if self.led_busy:
+            self.led_busy.blink(on_time=0.1, off_time=0.1)
+
+    def set_state_processing(self):
+        """Visual indicator: processing translation."""
+        if self.led_ready:
+            self.led_ready.off()
+        if self.led_busy:
+            self.led_busy.on()
+
+    def set_state_error(self):
+        """Visual indicator: error occurred."""
+        if self.led_ready:
+            self.led_ready.off()
+        if self.led_busy:
+            self.led_busy.blink(on_time=0.5, off_time=0.5)
+
+    # ─────────────────────────────────────
+    # MODEL LOADING (runs once at boot)
+    # ─────────────────────────────────────
+    def load_models(self):
+        """Load all AI models into memory. ~60s on Pi 5."""
+        self.set_state_processing()
+        print("\n" + "=" * 50)
+        print("  🔄 Loading AI models...")
+        print("=" * 50)
+
+        t_start = time.time()
+
+        self.whisper_model = load_whisper_model("base")
+        self.translation_models = load_translation_models()
+        self.embedding_model = load_embedding_model()
+
+        t_elapsed = time.time() - t_start
+        print(f"\n✅ All models loaded in {t_elapsed:.1f}s")
+        print(f"   RAM usage: ~1.3 GB / 8 GB\n")
+
+        self.set_state_ready()
+
+    # ─────────────────────────────────────
+    # AUDIO CAPTURE (runs in background)
+    # ─────────────────────────────────────
+    def audio_callback(self, indata, frames, time_info, status):
+        """
+        Called by sounddevice every 100ms while the stream is open.
+        Runs in a SEPARATE THREAD — must be fast, no heavy processing.
+
+        indata: numpy array of shape (BLOCK_SIZE, CHANNELS) = (1600, 1)
+                Each value is a float32 between -1.0 and 1.0
+                representing the audio waveform amplitude.
+
+        We just copy it into our buffer list. That's it.
+        """
+        if status:
+            print(f"⚠️  Audio status: {status}")
+
+        if self.is_recording:
+            self.audio_buffer.append(indata.copy())
+
+            # Safety limit: stop if recording too long
+            chunks_recorded = len(self.audio_buffer)
+            seconds_recorded = chunks_recorded * BLOCK_SIZE / SAMPLE_RATE
+            if seconds_recorded >= MAX_RECORD_SECONDS:
+                print(f"\n⚠️  Max recording time ({MAX_RECORD_SECONDS}s) reached.")
+                self.is_recording = False
+
+    # ─────────────────────────────────────
+    # RECORDING CONTROL
+    # ─────────────────────────────────────
+    def start_recording(self):
+        """Called when button is PRESSED (or Enter in keyboard mode)."""
+        if self.is_processing:
+            return  # Don't record while processing previous input
+
+        self.audio_buffer = []
+        self.is_recording = True
+        self.set_state_recording()
+        if self.use_gpio:
+            print("🎤 Recording... (release button to stop)")
+        else:
+            print("🎤 Recording... (press ENTER to stop)")
+
+    def stop_recording(self):
+        """Called when button is RELEASED (or Enter again in keyboard mode)."""
+        if not self.is_recording:
+            return
+
+        self.is_recording = False
+        chunk_count = len(self.audio_buffer)
+        duration = chunk_count * BLOCK_SIZE / SAMPLE_RATE
+        print(f"⏹️  Stopped. Captured {duration:.1f}s of audio ({chunk_count} chunks).")
+
+        if chunk_count == 0:
+            print("⚠️  No audio captured.\n")
+            self.set_state_ready()
+            return
+
+        # Process in a separate thread so GPIO/keyboard stays responsive
+        self.is_processing = True
+        self.set_state_processing()
+
+        # Concatenate all audio chunks into one array
+        full_audio = np.concatenate(self.audio_buffer, axis=0).flatten()
+        # Clear buffer to free memory
+        self.audio_buffer = []
+
+        # Run processing in background thread
+        thread = threading.Thread(target=self._process_and_reset,
+                                  args=(full_audio,))
+        thread.start()
+
+    def _process_and_reset(self, audio_data):
+        """Process audio and reset state when done."""
+        try:
+            self.process_audio(audio_data)
+        except Exception as e:
+            print(f"❌ Error during processing: {e}")
+            self.set_state_error()
+            time.sleep(2)
+        finally:
+            self.is_processing = False
+            self.set_state_ready()
+            if self.use_gpio:
+                print("🟢 Ready! Hold button to speak.\n")
+            else:
+                print("🟢 Ready! Press ENTER to speak.\n")
+
+    # ─────────────────────────────────────
+    # PROCESSING PIPELINE
+    # ─────────────────────────────────────
+    def process_audio(self, audio_data):
+        """
+        Full pipeline: audio → text → translate → verify → speak
+
+        This is where all the AI models run sequentially:
+        1. Whisper:   audio_data (numpy array) → text + detected language
+        2. MarianMT:  text → translated text
+        3. MiniLM:    verify translation quality
+        4. Edge-TTS:  translated text → audio file → play through USB speaker
+        """
+        t_pipeline = time.time()
+
+        # ── Step 1: Transcribe with Whisper ──
+        print("\n🔄 Transcribing speech...")
+        t_step = time.time()
+        text, detected_lang = transcribe_audio(
+            self.whisper_model, audio_data=audio_data
+        )
+        t_whisper = time.time() - t_step
+
+        if not text:
+            print("⚠️  No speech detected. Try again.")
+            return
+
+        src_name = LANGUAGE_NAMES.get(detected_lang, detected_lang)
+        print(f"📝 [{src_name}]: \"{text}\"  (Whisper: {t_whisper:.2f}s)")
+
+        # ── Step 2: Determine target language ──
+        target_lang = AUTO_TRANSLATE_MAP.get(detected_lang)
+        if target_lang is None:
+            print(f"⚠️  Language '{detected_lang}' not supported. Only EN ↔ ES.")
+            return
+
+        tgt_name = LANGUAGE_NAMES.get(target_lang, target_lang)
+
+        # ── Step 3: Translate ──
+        t_step = time.time()
+        translated = translate_text(
+            text, self.translation_models, detected_lang, target_lang
+        )
+        t_translate = time.time() - t_step
+        print(f"🔄 [{tgt_name}]: \"{translated}\"  (Translate: {t_translate:.2f}s)")
+
+        # ── Step 4: Verify translation quality ──
+        result = verify_translation(
+            text, translated, self.translation_models,
+            detected_lang, target_lang, self.embedding_model
+        )
+        t_verify = result['time_seconds']
+        print_verification(result, time.time() - t_pipeline)
+
+        # ── Step 5: Speak the translation through USB speaker ──
+        print(f"🔊 Speaking in {tgt_name}...")
+        t_step = time.time()
+        speak(translated, lang=target_lang)
+        t_tts = time.time() - t_step
+
+        # ── Summary ──
+        t_total = time.time() - t_pipeline
+        print(f"\n  📊 Pipeline breakdown:")
+        print(f"     Whisper (STT):    {t_whisper:.2f}s")
+        print(f"     Translation:      {t_translate:.2f}s")
+        print(f"     Verification:     {t_verify:.2f}s")
+        print(f"     TTS + playback:   {t_tts:.2f}s")
+        print(f"     ─────────────────────────")
+        print(f"     Total:            {t_total:.2f}s")
+
+    # ─────────────────────────────────────
+    # MAIN LOOPS
+    # ─────────────────────────────────────
+    def run_gpio_mode(self):
+        """Main loop using GPIO button — runs until Ctrl+C."""
+        print("🟢 Ready! Hold the button (GPIO 17) to speak.\n")
+
+        # Bind button events
+        self.button.when_pressed = self.start_recording
+        self.button.when_released = self.stop_recording
+
+        # Open audio stream from USB mic — callback runs in background thread
+        with sd.InputStream(samplerate=SAMPLE_RATE,
+                            channels=CHANNELS,
+                            blocksize=BLOCK_SIZE,
+                            device=self.mic_index,
+                            dtype="float32",
+                            callback=self.audio_callback):
+            try:
+                while True:
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                pass
+
+    def run_keyboard_mode(self):
+        """Keyboard mode — press Enter to start/stop recording."""
+        print("🟢 Ready! Press ENTER to start recording, ENTER again to stop.\n")
+
+        # Open audio stream from USB mic
+        with sd.InputStream(samplerate=SAMPLE_RATE,
+                            channels=CHANNELS,
+                            blocksize=BLOCK_SIZE,
+                            device=self.mic_index,
+                            dtype="float32",
+                            callback=self.audio_callback):
+            try:
+                while True:
+                    input("  [Press ENTER to record] ")
+
+                    if self.is_processing:
+                        print("  ⏳ Still processing... wait.\n")
+                        continue
+
+                    self.start_recording()
+                    input("  [Press ENTER to stop]   ")
+                    self.stop_recording()
+
+                    # Wait for processing to finish
+                    while self.is_processing:
+                        time.sleep(0.1)
+
+            except (KeyboardInterrupt, EOFError):
+                pass
+
+    def run(self):
+        """Start the device."""
+        print("\n" + "=" * 50)
+        print("  🌐 Edge Translator Device")
+        print("  Raspberry Pi 5 — USB Audio")
+        print("=" * 50)
+
+        # Configure USB audio devices
+        print("\n📡 Detecting USB audio devices...")
+        mic_idx, spk_idx = configure_audio_devices(
+            self.mic_index, self.speaker_index
+        )
+        self.mic_index = mic_idx
+
+        if mic_idx is None:
+            print("\n❌ No microphone found. Plug in a USB mic and try again.")
+            sys.exit(1)
+
+        # Load AI models
+        self.load_models()
+
+        # Show device summary
+        print("─" * 50)
+        mode = "GPIO push-to-talk" if self.use_gpio else "Keyboard (ENTER)"
+        print(f"  Mode:     {mode}")
+        print(f"  Audio in: USB mic [{mic_idx}]")
+        print(f"  Audio out: Speaker [{spk_idx}]")
+        print("─" * 50 + "\n")
+
+        # Run the appropriate mode
+        if self.use_gpio:
+            self.run_gpio_mode()
+        else:
+            self.run_keyboard_mode()
+
+        # Cleanup
+        print("\n👋 Shutting down.")
+        if self.led_ready:
+            self.led_ready.off()
+        if self.led_busy:
+            self.led_busy.off()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Edge Translator Device — USB Audio + Optional GPIO",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python edge_device.py                # Keyboard mode (default)
+  python edge_device.py --gpio         # Use GPIO button for push-to-talk
+  python edge_device.py --list-audio   # See all USB audio devices
+  python edge_device.py --mic 1        # Use device [1] as microphone
+  python edge_device.py --speaker 3    # Use device [3] as speaker
+        """
+    )
+    parser.add_argument("--gpio", action="store_true",
+                        help="Enable GPIO push-to-talk button and LEDs")
+    parser.add_argument("--list-audio", action="store_true",
+                        help="List all audio devices and exit")
+    parser.add_argument("--mic", type=int, default=None,
+                        help="Input device index for USB microphone")
+    parser.add_argument("--speaker", type=int, default=None,
+                        help="Output device index for USB speaker")
+    args = parser.parse_args()
+
+    # Just list devices and exit
+    if args.list_audio:
+        list_audio_devices()
+        print("\nUsage: python edge_device.py --mic <INDEX> --speaker <INDEX>\n")
+        sys.exit(0)
+
+    device = TranslatorDevice(
+        use_gpio=args.gpio,
+        mic_index=args.mic,
+        speaker_index=args.speaker,
+    )
+    device.run()
+
+
+if __name__ == "__main__":
+    main()

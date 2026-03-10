@@ -7,4 +7,6 @@ sounddevice
 scipy
 numpy
 sentence-transformers
+gpiozero
+lgpio
 
