@@ -296,7 +296,7 @@ def verify_translation(original, translated, models, source_lang, target_lang,
     }
 
 
-def print_verification(result):
+def print_verification(result, pipeline_start_time=None):
     """Pretty-print verification results."""
     print(f"\n  🔁 Back-check: \"{result['back_translated']}\"")
 
@@ -331,7 +331,14 @@ def print_verification(result):
 
         print(f"  {result['verdict']}")
 
-    print(f"  ⏱️  Verification took {result['time_seconds']:.2f}s\n")
+    # Show timing
+    print(f"  ⏱️  Verification: {result['time_seconds']:.2f}s", end="")
+    if pipeline_start_time is not None:
+        total_time = time.time() - pipeline_start_time
+        print(f"  |  Total pipeline: {total_time:.2f}s")
+    else:
+        print()
+    print()
 
 
 # ──────────────────────────────────────────────
@@ -408,7 +415,7 @@ def voice_translate_auto(whisper_model, translation_models, embedding_model):
     if audio is None:
         return
 
-    t_start = time.time()
+    t_pipeline = time.time()
     text, detected_lang = transcribe_audio(whisper_model, audio_data=audio)
 
     if not text:
@@ -427,14 +434,15 @@ def voice_translate_auto(whisper_model, translation_models, embedding_model):
     tgt_name = LANGUAGE_NAMES.get(target_lang, target_lang)
 
     # Step 3: Translate
+    t_translate_start = time.time()
     translated = translate_text(text, translation_models, detected_lang, target_lang)
-    t_translate = time.time() - t_start
+    t_translate = time.time() - t_translate_start
     print(f"🔄 {tgt_name}: \"{translated}\"  ({t_translate:.2f}s)")
 
     # Step 4: Verify translation
     result = verify_translation(text, translated, translation_models,
                                 detected_lang, target_lang, embedding_model)
-    print_verification(result)
+    print_verification(result, t_pipeline)
 
     # Step 5: Speak translation
     print(f"🔊 Speaking in {tgt_name}...")
@@ -464,7 +472,7 @@ def voice_translate(whisper_model, translation_models, embedding_model,
     if audio is None:
         return
 
-    t_start = time.time()
+    t_pipeline = time.time()
     text, detected_lang = transcribe_audio(whisper_model, audio_data=audio)
     print(f"📝 You said: \"{text}\"")
 
@@ -478,14 +486,15 @@ def voice_translate(whisper_model, translation_models, embedding_model,
         print(f"ℹ️  Note: Whisper detected {det_name}, but translating as {src_name} as selected.")
 
     # Step 2: Translate
+    t_translate_start = time.time()
     translated = translate_text(text, translation_models, source_lang, target_lang)
-    t_translate = time.time() - t_start
+    t_translate = time.time() - t_translate_start
     print(f"🔄 {tgt_name}: \"{translated}\"  ({t_translate:.2f}s)")
 
     # Step 3: Verify translation
     result = verify_translation(text, translated, translation_models,
                                 source_lang, target_lang, embedding_model)
-    print_verification(result)
+    print_verification(result, t_pipeline)
 
     # Step 4: Speak translation
     print(f"🔊 Speaking in {tgt_name}...")
@@ -528,9 +537,9 @@ def text_only_mode(translation_models, embedding_model):
         src_name = LANGUAGE_NAMES.get(source, source)
         tgt_name = LANGUAGE_NAMES.get(target, target)
 
-        t_start = time.time()
+        t_pipeline = time.time()
         translated = translate_text(text, translation_models, source, target)
-        t_translate = time.time() - t_start
+        t_translate = time.time() - t_pipeline
 
         print(f"  [{src_name} → {tgt_name}]")
         print(f"  {tgt_name}: {translated}  ({t_translate:.2f}s)")
@@ -538,7 +547,7 @@ def text_only_mode(translation_models, embedding_model):
         # Verify
         result = verify_translation(text, translated, translation_models,
                                     source, target, embedding_model)
-        print_verification(result)
+        print_verification(result, t_pipeline)
 
 
 def detect_text_language(text):
