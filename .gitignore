@@ -11,6 +11,9 @@ __pycache__/
 *.pt
 *.bin
 
+# Piper TTS voice models (downloaded at runtime, ~70MB)
+piper-voices/
+
 # Audio files
 *.mp3
 *.wav

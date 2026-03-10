@@ -1,6 +1,6 @@
 import os
 import sys
-import asyncio
+import wave
 import tempfile
 import subprocess
 import time
@@ -24,10 +24,11 @@ except (OSError, ImportError):
     print("   Text-only mode will still work.\n")
 
 try:
-    import edge_tts
+    from piper import PiperVoice
     TTS_AVAILABLE = True
 except ImportError:
-    print("⚠️  Text-to-speech unavailable (edge-tts not found).\n")
+    print("⚠️  Text-to-speech unavailable (piper-tts not found).")
+    print("   Install: pip install piper-tts\n")
 
 try:
     import whisper
@@ -49,11 +50,28 @@ except ImportError:
 SAMPLE_RATE = 16000  # Whisper expects 16kHz audio
 RECORD_SECONDS = 7   # Max recording duration per clip
 
-# Edge-TTS voice options (natural-sounding)
-VOICES = {
-    "en": "en-US-ChristopherNeural",   # English voice
-    "es": "es-MX-JorgeNeural",         # Spanish voice
+# ── Piper TTS voice models (fully offline, ~20-50MB each) ──
+# Downloaded from: https://huggingface.co/rhasspy/piper-voices
+# Stored in: ~/translator/piper-voices/
+PIPER_VOICES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "piper-voices")
+
+PIPER_VOICE_MODELS = {
+    "en": "en_US-amy-medium.onnx",       # English female voice (~20MB)
+    "es": "es_MX-claude-high.onnx",      # Spanish male voice (~50MB)
 }
+
+# URLs for downloading voice models
+PIPER_VOICE_URLS = {
+    "en": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx",
+    "es": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/claude/high/es_MX-claude-high.onnx",
+}
+PIPER_CONFIG_URLS = {
+    "en": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json",
+    "es": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/claude/high/es_MX-claude-high.onnx.json",
+}
+
+# Loaded PiperVoice objects (populated by load_tts_voices())
+_piper_voices = {}
 
 LANGUAGE_NAMES = {
     "en": "English",
@@ -114,6 +132,62 @@ def load_embedding_model():
         return None
     print("Loading embedding model (all-MiniLM-L6-v2)...")
     return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+def download_piper_voice(lang):
+    """Download a Piper voice model if not already present."""
+    import urllib.request
+
+    model_name = PIPER_VOICE_MODELS.get(lang)
+    if not model_name:
+        print(f"⚠️  No Piper voice configured for '{lang}'.")
+        return None
+
+    os.makedirs(PIPER_VOICES_DIR, exist_ok=True)
+
+    model_path = os.path.join(PIPER_VOICES_DIR, model_name)
+    config_path = model_path + ".json"
+
+    # Download .onnx model if missing
+    if not os.path.exists(model_path):
+        url = PIPER_VOICE_URLS.get(lang)
+        print(f"   Downloading {model_name}...")
+        urllib.request.urlretrieve(url, model_path)
+        print(f"   ✅ Saved to {model_path}")
+
+    # Download .onnx.json config if missing
+    if not os.path.exists(config_path):
+        url = PIPER_CONFIG_URLS.get(lang)
+        print(f"   Downloading {model_name}.json...")
+        urllib.request.urlretrieve(url, config_path)
+        print(f"   ✅ Saved to {config_path}")
+
+    return model_path
+
+
+def load_tts_voices():
+    """
+    Load Piper TTS voice models for EN and ES.
+    Downloads voice files on first run (~70MB total).
+    Returns dict of {lang: PiperVoice} or empty dict if unavailable.
+    """
+    global _piper_voices
+
+    if not TTS_AVAILABLE:
+        print("⚠️  Piper TTS not installed — speech output unavailable.")
+        return _piper_voices
+
+    print("Loading Piper TTS voices...")
+    for lang in ["en", "es"]:
+        try:
+            model_path = download_piper_voice(lang)
+            if model_path and os.path.exists(model_path):
+                _piper_voices[lang] = PiperVoice.load(model_path)
+                print(f"   ✅ {LANGUAGE_NAMES[lang]} voice loaded: {PIPER_VOICE_MODELS[lang]}")
+        except Exception as e:
+            print(f"   ⚠️  Failed to load {lang} voice: {e}")
+
+    return _piper_voices
 
 
 def record_audio(duration=RECORD_SECONDS, sample_rate=SAMPLE_RATE):
@@ -342,28 +416,41 @@ def print_verification(result, pipeline_start_time=None):
 
 
 # ──────────────────────────────────────────────
-# 4. TEXT-TO-SPEECH  (Edge TTS)
+# 4. TEXT-TO-SPEECH  (Piper TTS — fully offline)
 # ──────────────────────────────────────────────
-async def text_to_speech(text, lang="es", output_file="output.mp3"):
-    """Convert text to speech using edge-tts."""
-    if not TTS_AVAILABLE:
-        print("❌ edge-tts not available.")
+def text_to_speech(text, lang="es", output_file="output.wav"):
+    """
+    Convert text to speech using Piper TTS (local ONNX model).
+    No internet required — runs entirely on the Pi's CPU.
+
+    Piper uses a VITS neural network to generate raw PCM audio,
+    which we write out as a standard WAV file.
+    """
+    if not TTS_AVAILABLE or lang not in _piper_voices:
+        print(f"❌ Piper TTS not available for '{lang}'.")
         return None
-    voice = VOICES.get(lang, VOICES["en"])
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_file)
+
+    voice = _piper_voices[lang]
+
+    with wave.open(output_file, "wb") as wav_file:
+        voice.synthesize(text, wav_file)
+
     return output_file
 
 
 def speak(text, lang="es"):
-    """Synchronous wrapper to generate and play TTS audio."""
+    """Generate speech locally with Piper and play through speaker."""
     if not TTS_AVAILABLE:
         print("❌ Text-to-speech not available.")
         return
 
-    output_file = tempfile.mktemp(suffix=".mp3")
+    if lang not in _piper_voices:
+        print(f"❌ No voice loaded for '{lang}'. Run load_tts_voices() first.")
+        return
+
+    output_file = tempfile.mktemp(suffix=".wav")
     try:
-        asyncio.run(text_to_speech(text, lang, output_file))
+        text_to_speech(text, lang, output_file)
         play_audio(output_file)
     finally:
         if os.path.exists(output_file):
@@ -377,8 +464,8 @@ def play_audio(filepath):
         if system == "darwin":  # macOS
             subprocess.run(["afplay", filepath], check=True)
         elif system == "linux":
-            # Try common Linux audio players
-            for player in ["mpv", "ffplay", "aplay", "paplay"]:
+            # Try common Linux audio players (aplay is best for WAV on Pi)
+            for player in ["aplay", "paplay", "mpv", "ffplay"]:
                 if subprocess.run(["which", player], capture_output=True).returncode == 0:
                     if player == "ffplay":
                         subprocess.run([player, "-nodisp", "-autoexit", filepath],
@@ -592,15 +679,18 @@ def main():
     whisper_model = load_whisper_model("base")
     translation_models = load_translation_models()
     embedding_model = load_embedding_model()
+    tts_voices = load_tts_voices()
     print("\n✅ Models loaded!\n")
 
     # Show capability summary
+    tts_status = f"✅ Piper ({len(tts_voices)} voices)" if tts_voices else "❌ No piper-tts"
     print("Capabilities:")
     print(f"  Translation (text):  ✅ Ready")
     print(f"  Speech-to-text:      {'✅ Ready' if whisper_model else '❌ Unavailable'}")
     print(f"  Microphone input:    {'✅ Ready' if AUDIO_AVAILABLE else '❌ No PortAudio/mic'}")
-    print(f"  Text-to-speech:      {'✅ Ready' if TTS_AVAILABLE else '❌ No edge-tts'}")
+    print(f"  Text-to-speech:      {tts_status}")
     print(f"  Verification:        {'✅ Full (embeddings)' if embedding_model else '⚠️ Basic (word-level only)'}")
+    print(f"  Internet required:   ❌ No (fully offline)")
     print()
 
     voice_ok = AUDIO_AVAILABLE and whisper_model is not None

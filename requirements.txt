@@ -2,7 +2,7 @@ transformers
 torch
 sentencepiece
 openai-whisper
-edge-tts
+piper-tts
 sounddevice
 scipy
 numpy

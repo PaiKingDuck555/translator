@@ -33,6 +33,8 @@ import threading
 import numpy as np
 import sounddevice as sd
 from scipy.io.wavfile import write as write_wav
+from scipy.signal import resample_poly
+from math import gcd
 import tempfile
 
 # Import translation functions from our main module
@@ -40,6 +42,7 @@ from translate import (
     load_whisper_model,
     load_translation_models,
     load_embedding_model,
+    load_tts_voices,
     transcribe_audio,
     translate_text,
     verify_translation,
@@ -52,9 +55,8 @@ from translate import (
 # ──────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────
-SAMPLE_RATE = 16000      # Whisper expects 16kHz
+WHISPER_RATE = 16000     # Whisper expects 16kHz — we resample to this
 CHANNELS = 1             # Mono audio
-BLOCK_SIZE = 1600        # 100ms chunks (16000 × 0.1)
 MAX_RECORD_SECONDS = 30  # Safety limit
 
 # GPIO pins (BCM numbering) — only used with --gpio
@@ -110,11 +112,44 @@ def list_audio_devices():
     return inputs, outputs
 
 
+def get_mic_native_rate(mic_index):
+    """
+    Find the USB mic's native sample rate.
+
+    USB mics don't all support the same sample rates. A cheap USB mic
+    might only do 48kHz or 44.1kHz — if we try to open it at 16kHz
+    (what Whisper wants), PortAudio throws PaErrorCode -9997.
+
+    So we probe the device to find a rate it actually supports, then
+    record at that rate and resample to 16kHz later.
+    """
+    info = sd.query_devices(mic_index)
+    default_rate = int(info['default_samplerate'])
+
+    # Try the device's advertised default rate first
+    try:
+        sd.check_input_settings(device=mic_index, samplerate=default_rate)
+        return default_rate
+    except Exception:
+        pass
+
+    # Try common sample rates (highest first for best quality before resample)
+    for rate in [48000, 44100, 32000, 22050, 16000, 8000]:
+        try:
+            sd.check_input_settings(device=mic_index, samplerate=rate)
+            return rate
+        except Exception:
+            continue
+
+    # Last resort: return the advertised default and hope for the best
+    return default_rate
+
+
 def configure_audio_devices(mic_index=None, speaker_index=None):
     """
     Set the default sounddevice input/output devices.
     If indices are provided, use those; otherwise use system defaults.
-    Returns (input_device_index, output_device_index).
+    Returns (input_device_index, output_device_index, mic_sample_rate).
     """
     default_in, default_out = sd.default.device
 
@@ -139,6 +174,15 @@ def configure_audio_devices(mic_index=None, speaker_index=None):
             print(f"🎤 Mic: [{mic_index}] {info['name']} (default)")
         else:
             print("⚠️  No default input device found! Plug in a USB mic.")
+
+    # Detect mic's native sample rate
+    mic_rate = WHISPER_RATE  # fallback
+    if mic_index is not None:
+        mic_rate = get_mic_native_rate(mic_index)
+        if mic_rate != WHISPER_RATE:
+            print(f"   Native rate: {mic_rate} Hz → will resample to {WHISPER_RATE} Hz for Whisper")
+        else:
+            print(f"   Native rate: {mic_rate} Hz (matches Whisper, no resampling needed)")
 
     # Configure speaker (output)
     if speaker_index is not None:
@@ -165,7 +209,7 @@ def configure_audio_devices(mic_index=None, speaker_index=None):
     # Apply to sounddevice defaults
     sd.default.device = (mic_index, speaker_index)
 
-    return mic_index, speaker_index
+    return mic_index, speaker_index, mic_rate
 
 
 class TranslatorDevice:
@@ -180,6 +224,8 @@ class TranslatorDevice:
         self.is_processing = False
         self.mic_index = mic_index
         self.speaker_index = speaker_index
+        self.mic_rate = WHISPER_RATE  # Will be updated after device detection
+        self.block_size = 1600       # Recalculated based on mic_rate
 
         # Models (loaded at boot)
         self.whisper_model = None
@@ -245,10 +291,10 @@ class TranslatorDevice:
     # MODEL LOADING (runs once at boot)
     # ─────────────────────────────────────
     def load_models(self):
-        """Load all AI models into memory. ~60s on Pi 5."""
+        """Load all AI models into memory. ~60-90s on Pi 5."""
         self.set_state_processing()
         print("\n" + "=" * 50)
-        print("  🔄 Loading AI models...")
+        print("  🔄 Loading AI models (all local, no internet)...")
         print("=" * 50)
 
         t_start = time.time()
@@ -256,10 +302,11 @@ class TranslatorDevice:
         self.whisper_model = load_whisper_model("base")
         self.translation_models = load_translation_models()
         self.embedding_model = load_embedding_model()
+        self.tts_voices = load_tts_voices()
 
         t_elapsed = time.time() - t_start
         print(f"\n✅ All models loaded in {t_elapsed:.1f}s")
-        print(f"   RAM usage: ~1.3 GB / 8 GB\n")
+        print(f"   RAM usage: ~1.4 GB / 8 GB  (all offline)\n")
 
         self.set_state_ready()
 
@@ -268,10 +315,10 @@ class TranslatorDevice:
     # ─────────────────────────────────────
     def audio_callback(self, indata, frames, time_info, status):
         """
-        Called by sounddevice every 100ms while the stream is open.
+        Called by sounddevice every ~100ms while the stream is open.
         Runs in a SEPARATE THREAD — must be fast, no heavy processing.
 
-        indata: numpy array of shape (BLOCK_SIZE, CHANNELS) = (1600, 1)
+        indata: numpy array of shape (block_size, CHANNELS)
                 Each value is a float32 between -1.0 and 1.0
                 representing the audio waveform amplitude.
 
@@ -285,7 +332,7 @@ class TranslatorDevice:
 
             # Safety limit: stop if recording too long
             chunks_recorded = len(self.audio_buffer)
-            seconds_recorded = chunks_recorded * BLOCK_SIZE / SAMPLE_RATE
+            seconds_recorded = chunks_recorded * self.block_size / self.mic_rate
             if seconds_recorded >= MAX_RECORD_SECONDS:
                 print(f"\n⚠️  Max recording time ({MAX_RECORD_SECONDS}s) reached.")
                 self.is_recording = False
@@ -313,7 +360,7 @@ class TranslatorDevice:
 
         self.is_recording = False
         chunk_count = len(self.audio_buffer)
-        duration = chunk_count * BLOCK_SIZE / SAMPLE_RATE
+        duration = chunk_count * self.block_size / self.mic_rate
         print(f"⏹️  Stopped. Captured {duration:.1f}s of audio ({chunk_count} chunks).")
 
         if chunk_count == 0:
@@ -329,6 +376,34 @@ class TranslatorDevice:
         full_audio = np.concatenate(self.audio_buffer, axis=0).flatten()
         # Clear buffer to free memory
         self.audio_buffer = []
+
+        # ── Resample to 16kHz for Whisper if mic uses a different native rate ──
+        #
+        # Most USB mics record at 48kHz (48,000 samples/sec) but Whisper
+        # expects 16kHz. We can't just drop every 3rd sample because
+        # frequencies above 8kHz (the Nyquist limit for 16kHz) would
+        # "fold back" into the audible range as aliasing artifacts.
+        #
+        # resample_poly does three things:
+        #   1. Upsample by 'up' factor (insert zeros between samples)
+        #   2. Low-pass filter (removes frequencies above 8kHz so they
+        #      can't alias — this is the critical step)
+        #   3. Downsample by 'down' factor (keep every Nth sample)
+        #
+        # Example for 48kHz → 16kHz:
+        #   GCD(48000, 16000) = 8000
+        #   up   = 16000 / 8000 = 2   (upsample ×2 → 96kHz)
+        #   down = 48000 / 8000 = 6   (downsample ÷6 → 16kHz)
+        #   Net ratio: 2/6 = 1/3 — keeps 1 of every 3 samples, safely.
+        #
+        # Human speech lives below ~4kHz so cutting at 8kHz loses nothing.
+        #
+        if self.mic_rate != WHISPER_RATE:
+            print(f"   Resampling {self.mic_rate} Hz → {WHISPER_RATE} Hz...")
+            divisor = gcd(self.mic_rate, WHISPER_RATE)
+            up = WHISPER_RATE // divisor
+            down = self.mic_rate // divisor
+            full_audio = resample_poly(full_audio, up, down).astype(np.float32)
 
         # Run processing in background thread
         thread = threading.Thread(target=self._process_and_reset,
@@ -432,10 +507,10 @@ class TranslatorDevice:
         self.button.when_pressed = self.start_recording
         self.button.when_released = self.stop_recording
 
-        # Open audio stream from USB mic — callback runs in background thread
-        with sd.InputStream(samplerate=SAMPLE_RATE,
+        # Open audio stream from USB mic at its native rate
+        with sd.InputStream(samplerate=self.mic_rate,
                             channels=CHANNELS,
-                            blocksize=BLOCK_SIZE,
+                            blocksize=self.block_size,
                             device=self.mic_index,
                             dtype="float32",
                             callback=self.audio_callback):
@@ -449,10 +524,10 @@ class TranslatorDevice:
         """Keyboard mode — press Enter to start/stop recording."""
         print("🟢 Ready! Press ENTER to start recording, ENTER again to stop.\n")
 
-        # Open audio stream from USB mic
-        with sd.InputStream(samplerate=SAMPLE_RATE,
+        # Open audio stream from USB mic at its native rate
+        with sd.InputStream(samplerate=self.mic_rate,
                             channels=CHANNELS,
-                            blocksize=BLOCK_SIZE,
+                            blocksize=self.block_size,
                             device=self.mic_index,
                             dtype="float32",
                             callback=self.audio_callback):
@@ -484,10 +559,13 @@ class TranslatorDevice:
 
         # Configure USB audio devices
         print("\n📡 Detecting USB audio devices...")
-        mic_idx, spk_idx = configure_audio_devices(
+        mic_idx, spk_idx, mic_rate = configure_audio_devices(
             self.mic_index, self.speaker_index
         )
         self.mic_index = mic_idx
+        self.mic_rate = mic_rate
+        # ~100ms chunks at the mic's native rate
+        self.block_size = int(self.mic_rate * 0.1)
 
         if mic_idx is None:
             print("\n❌ No microphone found. Plug in a USB mic and try again.")
@@ -499,9 +577,10 @@ class TranslatorDevice:
         # Show device summary
         print("─" * 50)
         mode = "GPIO push-to-talk" if self.use_gpio else "Keyboard (ENTER)"
-        print(f"  Mode:     {mode}")
-        print(f"  Audio in: USB mic [{mic_idx}]")
-        print(f"  Audio out: Speaker [{spk_idx}]")
+        print(f"  Mode:       {mode}")
+        print(f"  Audio in:   USB mic [{mic_idx}] @ {self.mic_rate} Hz")
+        print(f"  Audio out:  Speaker [{spk_idx}]")
+        print(f"  Whisper in: {WHISPER_RATE} Hz {'(resampling)' if self.mic_rate != WHISPER_RATE else '(native)'}")
         print("─" * 50 + "\n")
 
         # Run the appropriate mode
