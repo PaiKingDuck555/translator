@@ -6,4 +6,5 @@ edge-tts
 sounddevice
 scipy
 numpy
+sentence-transformers
 
