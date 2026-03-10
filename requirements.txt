@@ -1,0 +1,9 @@
+transformers
+torch
+sentencepiece
+openai-whisper
+edge-tts
+sounddevice
+scipy
+numpy
+
